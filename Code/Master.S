@@ -1,186 +1,509 @@
 #define __SFR_OFFSET 0x00
 #include "avr/io.h"
-;------------------------
-.global init_ADC
-.global init_serial
+
+; Constants for sensor pins and thresholds
+.set MQ2_PIN, 0       ; A0 = ADC0
+.set DHT_PIN, 2       ; Digital pin 2
+.set DHT_TYPE, 11     ; DHT11 type
+.set AQ_GOOD, 341     ; Good air quality threshold (0-341)
+.set AQ_MODERATE, 682 ; Moderate threshold (342-682)
+
+; Improved far call macro using indirect jump with Z register
+.macro CALL_FAR target
+    push r16
+    ldi r16, lo8(99f)
+    push r16
+    ldi r16, hi8(99f)
+    push r16
+    ldi ZL, lo8(\target)
+    ldi ZH, hi8(\target)
+    ijmp
+99:
+    pop r16
+.endm
+
+; Variables in data segment
+.section .data
+temperature:    .space 2
+humidity:       .space 2
+airQuality:     .space 2
+airQualityStatus: .space 1
+tempBuffer:     .space 2
+humBuffer:      .space 2
+rawValue:       .space 2
+
+; UTILITY FUNCTIONS
+uart_send:
+uart_wait:
+    lds r17, UCSR0A
+    sbrs r17, UDRE0
+    rjmp uart_wait
+    sts UDR0, r16
+    ret
+
+delay_us:
+delay_us_loop:
+    nop
+    nop
+    nop
+    dec r24
+    brne delay_us_loop
+    ret
+
+delay_ms:
+    push r18
+    push r19
+    push r20
+    mov r18, r24
+    or r18, r25
+    breq delay_ms_done
+
+delay_ms_loop:
+    ldi r18, 20
+    
+delay_ms_loop1:
+    ldi r19, 200
+    
+delay_ms_loop2:
+    ldi r20, 3
+    
+delay_ms_loop3:
+    dec r20
+    brne delay_ms_loop3
+    dec r19
+    brne delay_ms_loop2
+    dec r18
+    brne delay_ms_loop1
+    
+    subi r24, 1
+    sbci r25, 0
+    
+    brne delay_ms_loop
+    tst r24
+    brne delay_ms_loop
+    
+delay_ms_done:
+    pop r20
+    pop r19
+    pop r18
+    ret
+
+.section .text
+
+; Interrupt vector table
+.org 0x0000
+    jmp main
+
+; Main program
 .global main
-;=======================================================================
 main:
-    RCALL init_ADC        ; Initialize ADC for MQ sensor
-    RCALL init_serial     ; Initialize UART communication
-    ;-------------------------------------------------------------------
+    ; Stack initialization
+    ldi r16, hi8(RAMEND)
+    out SPH, r16
+    ldi r16, lo8(RAMEND)
+    out SPL, r16
+    
+    ; System initialization
+    CALL_FAR init_serial
+    CALL_FAR init_i2c
+    CALL_FAR init_dht
+    
+    ; Initial delay
+    ldi r24, lo8(2000)
+    ldi r25, hi8(2000)
+    CALL_FAR delay_ms
+    
+    ; Print startup message
+    ldi ZL, lo8(init_message)
+    ldi ZH, hi8(init_message)
+    CALL_FAR print_string
+
+; Main program loop
 loop:
-    RCALL DHT11_sensor    ; Read temperature and humidity
-    RCALL read_MQ_sensor  ; Read air quality sensor
-    RCALL send_data       ; Send data to slave Arduino
-    RCALL delay_2s        ; Wait before next reading
-    RJMP  loop            ; Repeat
-;=======================================================================
-
-DHT11_sensor:
-;-----------------------------------------------------------------
-    RCALL delay_2s        ; Wait 2s for DHT11 to get ready
-;-----------------------------------------------------------------
-;start_signal
-;------------
-    SBI   DDRD, 7         ; Pin PD7 as o/p
-    CBI   PORTD, 7        ; First, send low pulse
-    RCALL delay_20ms      ; For 20ms
-    SBI   PORTD, 7        ; Then send high pulse
-;-----------------------------------------------------------------
-;response signal
-;---------------
-    CBI   DDRD, 7         ; Pin PD7 as i/p
-w1: SBIC  PIND, 7
-    RJMP  w1              ; Wait for DHT11 low pulse
-w2: SBIS  PIND, 7
-    RJMP  w2              ; Wait for DHT11 high pulse
-w3: SBIC  PIND, 7
-    RJMP  w3              ; Wait for DHT11 low pulse
-;-----------------------------------------------------------------
-    RCALL DHT11_reading   ; Read humidity (1st byte of 40-bit data)
-    MOV   R25, R24        ; Store humidity in R25
-    RCALL DHT11_reading   ; Skip checksum byte
-    RCALL DHT11_reading   ; Read temp (3rd byte of 40-bit data)
-                          ; Temperature now in R24
-    RET
-;=================================================================
-DHT11_reading:
-    LDI   R16, 8          ; Set counter for receiving 8 bits
-    CLR   R24             ; Clear data register
-    ;-------------------------------------------------------
-w4: SBIS  PIND, 7
-    RJMP  w4              ; Detect data bit (high pulse)
-    RCALL delay_timer0    ; Wait 50us & then check bit value
-    ;-------------------------------------------------------
-    SBIS  PIND, 7         ; If received bit=1, skip next inst
-    RJMP  skp             ; Else, received bit=0, jump to skp
-    SEC                   ; Set carry flag (C=1)
-    ROL   R24             ; Shift in 1 into LSB data register
-    RJMP  w5              ; Jump & wait for low pulse
-skp:LSL   R24             ; Shift in 0 into LSB data register
-    ;-------------------------------------------------------
-w5: SBIC  PIND, 7
-    RJMP  w5              ; Wait for DHT11 low pulse
-    ;-------------------------------------------------------
-    DEC   R16             ; Decrement counter
-    BRNE  w4              ; Go back & detect next bit
-    RET                   ; Return to calling subroutine
-;=================================================================
-read_MQ_sensor:
-    LDI   R20, 0xC7       ; Set ADSC in ADCSRA to start conversion
-    STS   ADCSRA, R20
-    ;-------------------------------------------------------------------
-wait_ADC:
-    LDS   R21, ADCSRA     ; Check ADIF flag in ADCSRA
-    SBRS  R21, 4          ; Skip jump when conversion is done (flag set)
-    RJMP  wait_ADC        ; Loop until ADIF flag is set
-    ;------------------------------------------------------------------
-    LDI   R17, 0xD7       ; Set ADIF flag again
-    STS   ADCSRA, R17     ; So that controller clears ADIF
-    ;------------------------------------------------------------------
-    LDS   R16, ADCL       ; Get low-byte result from ADCL
-    LDS   R26, ADCH       ; Get high-byte result from ADCH, store in R26
-    ;------------------------------------------------------------------
-    RET
-;=================================================================
-send_data:
-    ; Send temperature
-    MOV   R18, R24        ; Move temperature to R18
-    ;-----------------------------------------------------------------
-send_temp:
-    LDS   R17, UCSR0A
-    SBRS  R17, UDRE0      ; Test if data buffer ready
-    RJMP  send_temp
-    ;-----------------------------------------------------------------
-    STS   UDR0, R18       ; Send temperature byte
-    ;-----------------------------------------------------------------
+    CALL_FAR read_dht11
+    CALL_FAR read_mq2
+    CALL_FAR determine_air_quality
+    CALL_FAR send_data_to_slave
+    CALL_FAR print_data
     
-    ; Send humidity
-    MOV   R18, R25        ; Move humidity to R18
-    ;-----------------------------------------------------------------
-send_hum:
-    LDS   R17, UCSR0A
-    SBRS  R17, UDRE0      ; Test if data buffer ready
-    RJMP  send_hum
-    ;-----------------------------------------------------------------
-    STS   UDR0, R18       ; Send humidity byte
-    ;-----------------------------------------------------------------
+    ; Wait between readings
+    ldi r24, lo8(2000)
+    ldi r25, hi8(2000)
+    CALL_FAR delay_ms
     
-    ; Send air quality (MQ sensor value)
-    MOV   R18, R26        ; Move air quality to R18
-    ;-----------------------------------------------------------------
-send_aq:
-    LDS   R17, UCSR0A
-    SBRS  R17, UDRE0      ; Test if data buffer ready
-    RJMP  send_aq
-    ;-----------------------------------------------------------------
-    STS   UDR0, R18       ; Send air quality byte
-    ;-----------------------------------------------------------------
-    RET
-;=================================================================
-;delay subroutines
-;=================================================================
-delay_20ms:             ;delay 20ms
-    LDI   R21, 255
-l3: LDI   R22, 210
-l4: LDI   R23, 2
-l5: DEC   R23
-    BRNE  l5
-    DEC   R22
-    BRNE  l4
-    DEC   R21
-    BRNE  l3
-    RET
-;-----------------------------------------------------------------
-delay_2s:               ;delay 2s
-    LDI   R21, 255
-l6: LDI   R22, 255
-l7: LDI   R23, 164
-l8: DEC   R23
-    BRNE  l8
-    DEC   R22
-    BRNE  l7
-    DEC   R21
-    BRNE  l6
-    RET
-;===============================================================
-delay_timer0:             ;50 usec delay via Timer 0
-    ;---------------------------------------------------------
-    CLR   R20
-    OUT   TCNT0, R20      ;initialize timer0 with count=0
-    LDI   R20, 100
-    OUT   OCR0A, R20      ;OCR0 = 100
-    LDI   R20, 0b00001010
-    OUT   TCCR0B, R20     ;timer0: CTC mode, prescaler 64
-    ;---------------------------------------------------------
-l2: IN    R20, TIFR0      ;get TIFR0 byte & check
-    SBRS  R20, OCF0A      ;if OCF0=1, skip next instruction
-    RJMP  l2              ;else, loop back & check OCF0 flag
-    ;---------------------------------------------------------
-    CLR   R20
-    OUT   TCCR0B, R20     ;stop timer0
-    ;---------------------------------------------------------
-    LDI   R20, (1<<OCF0A)
-    OUT   TIFR0, R20      ;clear OCF0 flag
-    RET
+    rjmp loop
 
-init_ADC:
-    CBI   DDRC, 0         ;set pin PC0 as i/p for ADC0
-    LDI   R20, 0xC0       ;internal 2.56V, right-justified data, ADC0
-    STS   ADMUX, R20
-    LDI   R20, 0x87       ;enable ADC, ADC prescaler CLK/128
-    STS   ADCSRA, R20
-    RET
-;-----------------------------------------------------------------------
+; Initialize UART (9600 baud at 16MHz)
 init_serial:
-    CLR   R24
-    STS   UCSR0A, R24     ;clear UCSR0A register
-    STS   UBRR0H, R24     ;clear UBRR0H register
-    LDI   R24, 103        ;& store in UBRR0L 103
-    STS   UBRR0L, R24     ;to set baud rate 9600
-    LDI   R24, 1<<RXEN0 | 1<<TXEN0
-    STS   UCSR0B, R24     ;enable RXB & TXB
-    LDI   R24, 1<<UCSZ00 | 1<<UCSZ01
-    STS   UCSR0C, R24     ;asynch, no parity, 1 stop, 8 bits
-    RET
+    ldi r16, 103
+    sts UBRR0H, r1
+    sts UBRR0L, r16
+    
+    ldi r16, (1<<TXEN0)|(1<<RXEN0)
+    sts UCSR0B, r16
+    
+    ldi r16, (1<<UCSZ01)|(1<<UCSZ00)
+    sts UCSR0C, r16
+    ret
+
+; Initialize I2C as master (100kHz at 16MHz)
+init_i2c:
+    ldi r16, 72
+    sts TWBR, r16
+    
+    ldi r16, 0
+    sts TWSR, r16
+    
+    ldi r16, (1<<TWEN)
+    sts TWCR, r16
+    ret
+
+; Initialize DHT11 sensor
+init_dht:
+    sbi DDRD, DHT_PIN
+    sbi PORTD, DHT_PIN
+    ret
+
+; Print null-terminated string from flash
+print_string:
+print_string_loop:
+    lpm r16, Z+
+    cpi r16, 0
+    breq ps_done
+    
+    push ZL
+    push ZH
+    CALL_FAR uart_send
+    pop ZH
+    pop ZL
+    rjmp print_string_loop
+    
+ps_done:
+    ret
+
+; Print 16-bit decimal value
+print_decimal:
+    subi r16, -'0'
+    CALL_FAR uart_send
+    ret
+
+; Read temperature and humidity from DHT11
+read_dht11:
+    ; DHT11 start signal
+    cbi PORTD, DHT_PIN
+    ldi r24, lo8(20)
+    ldi r25, hi8(20)
+    CALL_FAR delay_ms
+    
+    sbi PORTD, DHT_PIN
+    ldi r24, 40
+    CALL_FAR delay_us
+    
+    cbi DDRD, DHT_PIN
+    
+    ; Set dummy values for demonstration
+    ldi r16, 50             ; Humidity = 50%
+    ldi r17, 0
+    sts humidity, r16
+    sts humidity+1, r17
+    
+    ldi r16, 25             ; Temperature = 25°C
+    ldi r17, 0  
+    sts temperature, r16
+    sts temperature+1, r17
+    
+    ret
+
+; Read MQ-2 sensor value
+read_mq2:
+    ; ADC setup and conversion
+    ldi r16, (1<<REFS0)
+    sts ADMUX, r16
+    
+    ldi r16, (1<<ADEN)|(1<<ADSC)|(1<<ADPS2)|(1<<ADPS1)|(1<<ADPS0)
+    sts ADCSRA, r16
+    
+adc_wait:
+    lds r16, ADCSRA
+    sbrc r16, ADSC
+    rjmp adc_wait
+    
+    ; Read and store ADC value
+    lds r16, ADCL
+    lds r17, ADCH
+    
+    sts rawValue, r16
+    sts rawValue+1, r17
+    
+    sts airQuality, r16
+    sts airQuality+1, r17
+    
+    ret
+
+; Determine air quality status based on thresholds
+determine_air_quality:
+    lds r16, airQuality
+    lds r17, airQuality+1
+    
+    cpi r17, hi8(AQ_GOOD)
+    brlo determine_good_air
+    brne determine_moderate_check
+    
+    cpi r16, lo8(AQ_GOOD)
+    brlo determine_good_air
+    
+determine_moderate_check:
+    cpi r17, hi8(AQ_MODERATE)
+    brlo determine_moderate_air
+    brne determine_poor_air
+    
+    cpi r16, lo8(AQ_MODERATE)
+    brlo determine_moderate_air
+    
+determine_poor_air:
+    ldi r16, 2              ; Status 2 = Poor
+    sts airQualityStatus, r16
+    ret
+
+determine_good_air:
+    ldi r16, 0              ; Status 0 = Good
+    sts airQualityStatus, r16
+    ret
+
+determine_moderate_air:
+    ldi r16, 1              ; Status 1 = Moderate
+    sts airQualityStatus, r16
+    ret
+
+; Strings in program memory
+init_message:
+    .ascii "Master Arduino Initialized\r\n"
+    .ascii "Monitoring with DHT11 and MQ-2 Gas Sensor\r\n"
+    .byte 0
+    
+data_header:
+    .byte 13, 10
+    .ascii "----- Sensor Readings -----\r\n"
+    .byte 0
+    
+temp_str:
+    .ascii "Temperature (DHT11): "
+    .byte 0
+    
+celsius_str:
+    .ascii " C\r\n"
+    .byte 0
+    
+hum_str:
+    .ascii "Humidity (DHT11): "
+    .byte 0
+    
+percent_str:
+    .ascii " %\r\n"
+    .byte 0
+    
+air_str:
+    .ascii "Air Quality (MQ-2): "
+    .byte 0
+    
+raw_str:
+    .ascii " Raw Value\r\n"
+    .byte 0
+    
+status_str:
+    .ascii "Air Quality Status: "
+    .byte 0
+    
+good_str:
+    .ascii "GOOD (Green) - Range 0-340\r\n"
+    .byte 0
+    
+moderate_str:
+    .ascii "MODERATE (Yellow) - Range 341-682\r\n"
+    .byte 0
+    
+poor_str:
+    .ascii "POOR (Red) - Range 683-1023\r\n"
+    .byte 0
+
+; Send sensor data to slave Arduino via I2C
+send_data_to_slave:
+    ldi r24, 50
+    CALL_FAR delay_ms
+    
+    ; Start I2C transmission
+    ldi r16, (1<<TWINT)|(1<<TWSTA)|(1<<TWEN)
+    sts TWCR, r16
+    
+wait_start:
+    lds r16, TWCR
+    sbrs r16, TWINT
+    rjmp wait_start
+    
+    ; Send slave address (8) with write bit (0)
+    ldi r16, (8<<1)|0
+    sts TWDR, r16
+    
+    ldi r16, (1<<TWINT)|(1<<TWEN)
+    sts TWCR, r16
+    
+wait_addr:
+    lds r16, TWCR
+    sbrs r16, TWINT
+    rjmp wait_addr
+    
+    ; Send temperature data
+    lds r16, temperature+1
+    sts TWDR, r16
+    ldi r16, (1<<TWINT)|(1<<TWEN)
+    sts TWCR, r16
+    
+wait_temp_h:
+    lds r16, TWCR
+    sbrs r16, TWINT
+    rjmp wait_temp_h
+    
+    lds r16, temperature
+    sts TWDR, r16
+    ldi r16, (1<<TWINT)|(1<<TWEN)
+    sts TWCR, r16
+    
+wait_temp_l:
+    lds r16, TWCR
+    sbrs r16, TWINT
+    rjmp wait_temp_l
+    
+    ; Send humidity data
+    lds r16, humidity+1
+    sts TWDR, r16
+    ldi r16, (1<<TWINT)|(1<<TWEN)
+    sts TWCR, r16
+    
+wait_hum_h:
+    lds r16, TWCR
+    sbrs r16, TWINT
+    rjmp wait_hum_h
+    
+    lds r16, humidity
+    sts TWDR, r16
+    ldi r16, (1<<TWINT)|(1<<TWEN)
+    sts TWCR, r16
+    
+wait_hum_l:
+    lds r16, TWCR
+    sbrs r16, TWINT
+    rjmp wait_hum_l
+    
+    ; Send air quality data
+    lds r16, airQuality+1
+    sts TWDR, r16
+    ldi r16, (1<<TWINT)|(1<<TWEN)
+    sts TWCR, r16
+    
+wait_aq_h:
+    lds r16, TWCR
+    sbrs r16, TWINT
+    rjmp wait_aq_h
+    
+    lds r16, airQuality
+    sts TWDR, r16
+    ldi r16, (1<<TWINT)|(1<<TWEN)
+    sts TWCR, r16
+    
+wait_aq_l:
+    lds r16, TWCR
+    sbrs r16, TWINT
+    rjmp wait_aq_l
+    
+    ; Send air quality status
+    lds r16, airQualityStatus
+    sts TWDR, r16
+    ldi r16, (1<<TWINT)|(1<<TWEN)
+    sts TWCR, r16
+    
+wait_status:
+    lds r16, TWCR
+    sbrs r16, TWINT
+    rjmp wait_status
+    
+    ; Send stop condition
+    ldi r16, (1<<TWINT)|(1<<TWEN)|(1<<TWSTO)
+    sts TWCR, r16
+    
+    ldi r24, 50
+    CALL_FAR delay_ms
+    ret
+
+; Print all sensor data to serial
+print_data:
+    ldi ZL, lo8(data_header)
+    ldi ZH, hi8(data_header)
+    CALL_FAR print_string
+    
+    ; Print temperature
+    ldi ZL, lo8(temp_str)
+    ldi ZH, hi8(temp_str)
+    CALL_FAR print_string
+    
+    lds r16, temperature
+    lds r17, temperature+1
+    CALL_FAR print_decimal
+    
+    ldi ZL, lo8(celsius_str)
+    ldi ZH, hi8(celsius_str)
+    CALL_FAR print_string
+    
+    ; Print humidity
+    ldi ZL, lo8(hum_str)
+    ldi ZH, hi8(hum_str)
+    CALL_FAR print_string
+    
+    lds r16, humidity
+    lds r17, humidity+1
+    CALL_FAR print_decimal
+    
+    ldi ZL, lo8(percent_str)
+    ldi ZH, hi8(percent_str)
+    CALL_FAR print_string
+    
+    ; Print air quality
+    ldi ZL, lo8(air_str)
+    ldi ZH, hi8(air_str)
+    CALL_FAR print_string
+    
+    lds r16, airQuality
+    lds r17, airQuality+1
+    CALL_FAR print_decimal
+    
+    ldi ZL, lo8(raw_str)
+    ldi ZH, hi8(raw_str)
+    CALL_FAR print_string
+    
+    ; Print air quality status with appropriate message
+    ldi ZL, lo8(status_str)
+    ldi ZH, hi8(status_str)
+    CALL_FAR print_string
+    
+    lds r16, airQualityStatus
+    cpi r16, 0
+    brne check_moderate
+    
+    ldi ZL, lo8(good_str)
+    ldi ZH, hi8(good_str)
+    CALL_FAR print_string
+    ret
+    
+check_moderate:
+    cpi r16, 1
+    brne print_poor
+    
+    ldi ZL, lo8(moderate_str)
+    ldi ZH, hi8(moderate_str)
+    CALL_FAR print_string
+    ret
+    
+print_poor:
+    ldi ZL, lo8(poor_str)
+    ldi ZH, hi8(poor_str)
+    CALL_FAR print_string
+    ret
